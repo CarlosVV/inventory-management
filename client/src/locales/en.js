@@ -6,6 +6,7 @@ export default {
     orders: 'Orders',
     finance: 'Finance',
     demandForecast: 'Demand Forecast',
+    restocking: 'Restocking',
     companyName: 'Catalyst Components',
     subtitle: 'Inventory Management System'
   },
@@ -112,6 +113,15 @@ export default {
     onTimeDelivery: 'On-Time Delivery',
     itemsCount: '{count} items',
     quantity: 'Qty',
+    submitted: {
+      title: 'Submitted Orders',
+      description: 'Restocking orders placed from the Restocking tab',
+      empty: 'No restocking orders have been submitted yet.',
+      leadTime: 'Lead Time',
+      leadTimeDays: '{days} days',
+      budget: 'Budget',
+      status: 'Submitted'
+    },
     table: {
       orderNumber: 'Order Number',
       orderId: 'Order ID',
@@ -127,6 +137,45 @@ export default {
       expectedDelivery: 'Expected Delivery',
       actualDelivery: 'Actual Delivery'
     }
+  },
+
+  // Restocking
+  restocking: {
+    title: 'Restocking',
+    description: 'Set a budget and restock the items the demand forecast says will run short',
+    budget: {
+      title: 'Available Budget',
+      label: 'Budget',
+      recommended: 'Recommended Spend',
+      remaining: 'Remaining',
+      itemsSelected: '{count} of {total} items fit'
+    },
+    recommendations: {
+      title: 'Recommended Restocks',
+      description: 'Ranked by forecast gap. Items are selected until the budget runs out.',
+      empty: 'No items need restocking right now.',
+      noneFit: 'Nothing fits this budget. Raise the budget to see recommendations.',
+      gap: 'Gap',
+      recommendedBadge: 'Recommended',
+      skippedBadge: 'Over budget'
+    },
+    table: {
+      item: 'Item',
+      category: 'Category',
+      warehouse: 'Warehouse',
+      currentDemand: 'Current',
+      forecastedDemand: 'Forecast',
+      quantity: 'Order Qty',
+      unitCost: 'Unit Cost',
+      lineTotal: 'Line Total',
+      leadTime: 'Lead Time',
+      status: 'Status'
+    },
+    placeOrder: 'Place Order',
+    placing: 'Placing order…',
+    success: 'Order {orderNumber} submitted. Expected delivery in {days} days.',
+    viewOrders: 'View in Orders',
+    error: 'Could not place the order. Try again.'
   },
 
   // Finance/Spending
