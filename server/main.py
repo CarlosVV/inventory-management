@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Literal, Optional
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -13,6 +14,29 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# Supplier lead time in days by inventory category. Used to compute the
+# expected delivery date of restocking orders (order date + lead time).
+LEAD_TIME_DAYS = {
+    'Circuit Boards': 14,
+    'Sensors': 10,
+    'Actuators': 21,
+    'Controllers': 18,
+    'Power Supplies': 12,
+}
+DEFAULT_LEAD_TIME_DAYS = 14
+
+# Restocking orders live only in memory, like every other dataset here.
+# They reset when the server restarts and are never written to disk.
+restocking_orders: list = []
+
+# Tasks created from the Tasks modal. Same in-memory rule as restocking
+# orders: they live in this list and disappear on restart. The client also
+# shows four hard-coded mock tasks (client/src/composables/useAuth.js) with
+# ids 1-4 and merges them with this list, so API ids start at 1000 to keep
+# the two sets from colliding in the modal's toggle/delete handlers.
+tasks: list = []
+TASK_ID_START = 1000
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -119,6 +143,60 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+# Field names are camelCase here, unlike the rest of the API, because the
+# Tasks modal and useAuth.js mock tasks already use `dueDate` and the client
+# merges API tasks with mock tasks into one list.
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: Literal["low", "medium", "high"]
+    dueDate: str
+    status: Literal["pending", "completed"] = "pending"
+
+class CreateTaskRequest(BaseModel):
+    title: str = Field(min_length=1)
+    priority: Literal["low", "medium", "high"] = "medium"
+    dueDate: str = Field(min_length=1)
+
+class RestockingRecommendation(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    current_demand: int
+    forecasted_demand: int
+    trend: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+    recommended: bool
+
+class RestockingRecommendationsResponse(BaseModel):
+    budget: float
+    items: List[RestockingRecommendation]
+    recommended_total: float
+    remaining_budget: float
+
+class RestockingOrderItemRequest(BaseModel):
+    sku: str
+    quantity: int = Field(gt=0)
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItemRequest] = Field(min_length=1)
+    budget: Optional[float] = None
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    status: str
+    items: List[dict]
+    order_date: str
+    expected_delivery: str
+    lead_time_days: int
+    total_value: float
+    budget: Optional[float] = None
 
 # API endpoints
 @app.get("/")
@@ -303,6 +381,156 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+def build_restocking_candidates() -> list:
+    """Join demand forecasts with inventory so each candidate has a unit cost.
+
+    Only forecasts whose SKU exists in inventory are priced. The quantity to
+    order is the forecast gap (forecasted minus current demand); items with no
+    positive gap are not restocking candidates.
+    """
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+    candidates = []
+    for forecast in demand_forecasts:
+        item = inventory_by_sku.get(forecast["item_sku"])
+        if not item:
+            continue
+        gap = forecast["forecasted_demand"] - forecast["current_demand"]
+        if gap <= 0:
+            continue
+        unit_cost = item["unit_cost"]
+        candidates.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "current_demand": forecast["current_demand"],
+            "forecasted_demand": forecast["forecasted_demand"],
+            "trend": forecast["trend"],
+            "quantity": gap,
+            "unit_cost": unit_cost,
+            "line_total": round(gap * unit_cost, 2),
+            "lead_time_days": LEAD_TIME_DAYS.get(item["category"], DEFAULT_LEAD_TIME_DAYS),
+            "recommended": False,
+        })
+    # Largest forecast gap first: the items about to run short come first.
+    candidates.sort(key=lambda c: c["quantity"], reverse=True)
+    return candidates
+
+@app.get("/api/restocking/recommendations", response_model=RestockingRecommendationsResponse)
+def get_restocking_recommendations(budget: float = 0):
+    """Recommend which forecast items to restock within a budget.
+
+    Greedy fill in gap order: an item is recommended when its full line total
+    still fits in the remaining budget. Items that do not fit are skipped, not
+    truncated, so a cheaper item further down the list can still be picked.
+    """
+    if budget < 0:
+        raise HTTPException(status_code=422, detail="Budget must be zero or greater")
+
+    candidates = build_restocking_candidates()
+    remaining = budget
+    recommended_total = 0.0
+    for candidate in candidates:
+        if candidate["line_total"] <= remaining:
+            candidate["recommended"] = True
+            remaining -= candidate["line_total"]
+            recommended_total += candidate["line_total"]
+
+    return {
+        "budget": budget,
+        "items": candidates,
+        "recommended_total": round(recommended_total, 2),
+        "remaining_budget": round(remaining, 2),
+    }
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder, status_code=201)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    """Submit a restocking order. Kept in memory only."""
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+    order_items = []
+    total_value = 0.0
+    max_lead_time = 0
+    for line in request.items:
+        item = inventory_by_sku.get(line.sku)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Unknown SKU: {line.sku}")
+        lead_time = LEAD_TIME_DAYS.get(item["category"], DEFAULT_LEAD_TIME_DAYS)
+        line_total = round(line.quantity * item["unit_cost"], 2)
+        order_items.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "quantity": line.quantity,
+            "unit_price": item["unit_cost"],
+            "line_total": line_total,
+            "lead_time_days": lead_time,
+        })
+        total_value += line_total
+        # The order ships complete, so its lead time is the slowest line.
+        max_lead_time = max(max_lead_time, lead_time)
+
+    now = datetime.now().replace(microsecond=0)
+    order = {
+        "id": str(len(restocking_orders) + 1),
+        "order_number": f"RST-{now.year}-{len(restocking_orders) + 1:04d}",
+        "status": "Submitted",
+        "items": order_items,
+        "order_date": now.isoformat(),
+        "expected_delivery": (now + timedelta(days=max_lead_time)).isoformat(),
+        "lead_time_days": max_lead_time,
+        "total_value": round(total_value, 2),
+        "budget": request.budget,
+    }
+    restocking_orders.append(order)
+    return order
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """List submitted restocking orders, newest first."""
+    return list(reversed(restocking_orders))
+
+# --- Tasks -------------------------------------------------------------------
+# Backs the Tasks modal in App.vue: list on load, create from the form,
+# PATCH toggles pending/completed (the client sends no body), DELETE removes.
+
+def find_task(task_id: int) -> dict:
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """List tasks created through the API, newest first."""
+    return list(reversed(tasks))
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    """Create a pending task. Ids are sequential from TASK_ID_START."""
+    task = {
+        "id": TASK_ID_START + len(tasks),
+        "title": request.title.strip(),
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending",
+    }
+    tasks.append(task)
+    return task
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    """Flip a task between pending and completed and return it."""
+    task = find_task(task_id)
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    """Remove a task. 404 if the id is unknown (mock tasks 1-4 never reach here)."""
+    tasks.remove(find_task(task_id))
+    return None
 
 if __name__ == "__main__":
     import uvicorn
