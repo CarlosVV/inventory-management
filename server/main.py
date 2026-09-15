@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Literal, Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
@@ -29,6 +29,14 @@ DEFAULT_LEAD_TIME_DAYS = 14
 # Restocking orders live only in memory, like every other dataset here.
 # They reset when the server restarts and are never written to disk.
 restocking_orders: list = []
+
+# Tasks created from the Tasks modal. Same in-memory rule as restocking
+# orders: they live in this list and disappear on restart. The client also
+# shows four hard-coded mock tasks (client/src/composables/useAuth.js) with
+# ids 1-4 and merges them with this list, so API ids start at 1000 to keep
+# the two sets from colliding in the modal's toggle/delete handlers.
+tasks: list = []
+TASK_ID_START = 1000
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -135,6 +143,21 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+# Field names are camelCase here, unlike the rest of the API, because the
+# Tasks modal and useAuth.js mock tasks already use `dueDate` and the client
+# merges API tasks with mock tasks into one list.
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: Literal["low", "medium", "high"]
+    dueDate: str
+    status: Literal["pending", "completed"] = "pending"
+
+class CreateTaskRequest(BaseModel):
+    title: str = Field(min_length=1)
+    priority: Literal["low", "medium", "high"] = "medium"
+    dueDate: str = Field(min_length=1)
 
 class RestockingRecommendation(BaseModel):
     sku: str
@@ -467,6 +490,47 @@ def create_restocking_order(request: CreateRestockingOrderRequest):
 def get_restocking_orders():
     """List submitted restocking orders, newest first."""
     return list(reversed(restocking_orders))
+
+# --- Tasks -------------------------------------------------------------------
+# Backs the Tasks modal in App.vue: list on load, create from the form,
+# PATCH toggles pending/completed (the client sends no body), DELETE removes.
+
+def find_task(task_id: int) -> dict:
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """List tasks created through the API, newest first."""
+    return list(reversed(tasks))
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    """Create a pending task. Ids are sequential from TASK_ID_START."""
+    task = {
+        "id": TASK_ID_START + len(tasks),
+        "title": request.title.strip(),
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending",
+    }
+    tasks.append(task)
+    return task
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    """Flip a task between pending and completed and return it."""
+    task = find_task(task_id)
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    """Remove a task. 404 if the id is unknown (mock tasks 1-4 never reach here)."""
+    tasks.remove(find_task(task_id))
+    return None
 
 if __name__ == "__main__":
     import uvicorn
